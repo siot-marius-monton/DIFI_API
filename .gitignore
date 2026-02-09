@@ -26,7 +26,6 @@ module_b
 sender_C_example
 sender_cpp_example
 single_process_demo
-difi_dpdk_receiver
 difi_send
 difi_recv
 difi_test

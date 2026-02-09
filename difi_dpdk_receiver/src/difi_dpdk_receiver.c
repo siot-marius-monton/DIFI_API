@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -83,6 +84,9 @@ static uint32_t g_word0_template;
 
 /* Pre-allocated send buffers for --use-shm (one per stream; header pre-filled, only seq+ts+payload updated) */
 static uint8_t *g_shm_difi_bufs[IQ_MAX_STREAMS];
+
+/* Pre-allocated DIFI header buffers for mbuf path (one per stream); used with sendmsg iovec to avoid touching mbuf payload */
+static uint8_t *g_mbuf_header_bufs[IQ_MAX_STREAMS];
 
 /* Per-stream stats */
 static uint64_t g_sent[IQ_MAX_STREAMS];
@@ -192,6 +196,31 @@ static int send_packet(const uint8_t *buf, uint32_t total_len)
 	return 0;
 }
 
+/* Zero-copy send: header (pre-filled buffer) + payload (pointer into mbuf) via sendmsg iovec. No memcpy. */
+static int send_packet_iov(const uint8_t *header, uint32_t header_len,
+                           const uint8_t *payload, uint32_t payload_len)
+{
+	struct iovec iov[2];
+	iov[0].iov_base = (void *)header;
+	iov[0].iov_len  = (size_t)header_len;
+	iov[1].iov_base = (void *)payload;
+	iov[1].iov_len  = (size_t)payload_len;
+
+	struct msghdr msg = {0};
+	msg.msg_name    = (void *)&g_dest_saddr;
+	msg.msg_namelen = sizeof(g_dest_saddr);
+	msg.msg_iov     = iov;
+	msg.msg_iovlen  = 2;
+
+	ssize_t n = sendmsg(g_udp_sock, &msg, 0);
+	uint32_t total = header_len + payload_len;
+	if (n < 0 || (uint32_t)n != total) {
+		if (n < 0) perror("sendmsg");
+		return -1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int ret;
@@ -252,6 +281,17 @@ int main(int argc, char **argv)
 		if (!rte_pktmbuf_pool_create(name, MBUF_POOL_SIZE, 0, 0,
 				MBUF_DATA_SIZE + RTE_PKTMBUF_HEADROOM, rte_socket_id()))
 			rte_exit(EXIT_FAILURE, "mempool create failed: %s\n", rte_strerror(rte_errno));
+		/* Pre-allocate and pre-fill one DIFI header buffer per stream for zero-copy sendmsg (no write into mbuf) */
+		for (s = 0; s < g_streams; s++) {
+			g_mbuf_header_bufs[s] = malloc(DIFI_HEADER_BYTES);
+			if (!g_mbuf_header_bufs[s])
+				rte_exit(EXIT_FAILURE, "malloc mbuf_header_buf stream %u failed\n", (unsigned)s);
+			uint8_t *b = g_mbuf_header_bufs[s];
+			store_be32(b + 0, g_word0_template);
+			store_be32(b + 4, (uint32_t)s);
+			memcpy(b + 8, g_class_id_blob, 12);
+			memset(b + 20, 0, 12);
+		}
 	}
 
 	for (s = 0; s < g_streams; s++) {
@@ -348,15 +388,14 @@ int main(int argc, char **argv)
 					continue;
 				}
 
-				uint8_t *buf = rte_pktmbuf_mtod(chunk_mbuf, uint8_t *);
+				uint8_t *payload_ptr = rte_pktmbuf_mtod(chunk_mbuf, uint8_t *) + DIFI_HEADER_BYTES;
 				uint32_t ts_sec;
 				uint64_t ts_ps;
 				timestamp_ns_to_difi(hdr->timestamp_ns, &ts_sec, &ts_ps);
-				write_difi_header_variable(buf, (uint32_t)hdr->stream_id,
+				write_difi_header_variable(g_mbuf_header_bufs[s], (uint32_t)hdr->stream_id,
 					(uint8_t)(hdr->seq & 0xF), ts_sec, ts_ps);
-				memcpy(buf + 8, g_class_id_blob, 12);
 
-				if (send_packet(buf, g_total_chunk_bytes) == 0)
+				if (send_packet_iov(g_mbuf_header_bufs[s], DIFI_HEADER_BYTES, payload_ptr, g_payload_bytes) == 0)
 					g_sent[s]++;
 				rte_pktmbuf_free(chunk_mbuf);
 			}
@@ -393,6 +432,9 @@ int main(int argc, char **argv)
 	if (g_use_shm) {
 		for (s = 0; s < g_streams; s++)
 			free(g_shm_difi_bufs[s]);
+	} else {
+		for (s = 0; s < g_streams; s++)
+			free(g_mbuf_header_bufs[s]);
 	}
 	rte_eal_cleanup();
 	return 0;
