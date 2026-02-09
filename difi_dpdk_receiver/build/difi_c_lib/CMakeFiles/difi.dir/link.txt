@@ -1,0 +1,2 @@
+/usr/bin/ar qc libdifi.a CMakeFiles/difi.dir/src/difi.c.o
+/usr/bin/ranlib libdifi.a
