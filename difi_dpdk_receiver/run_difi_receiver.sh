@@ -3,6 +3,7 @@
 # Use from DIFI_API directory:
 #   sudo ./difi_dpdk_receiver/run_difi_receiver.sh
 # Optional: DIFI_DEST=host:port (default 127.0.0.1:50000)
+# Optional: DIFI_MAX_RATE=1 to run sender with --no-rate-limit (max throughput; receiver must keep up)
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -19,6 +20,8 @@ EAL_OPTS="--proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 
 EAL_OPTS_SEC="--proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem $EAL_MEM"
 APP_OPTS="--streams 16 --chunk-ms 2 --use-shm"
 DEST="${DIFI_DEST:-127.0.0.1:50000}"
+SENDER_APP_OPTS="$APP_OPTS"
+[ -n "${DIFI_MAX_RATE}" ] && [ "$DIFI_MAX_RATE" != "0" ] && SENDER_APP_OPTS="$SENDER_APP_OPTS --no-rate-limit"
 
 RECEIVER="${SCRIPT_DIR}/build/difi_dpdk_receiver"
 SENDER="${API_DIR}/sender_C_example/build/sender_C_example"
@@ -45,7 +48,7 @@ cleanup() { sudo kill $B_PID 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
 set +e
-sudo setarch "$SETARCH_ARCH" -R "$SENDER" $EAL_OPTS_SEC -- $APP_OPTS
+sudo setarch "$SETARCH_ARCH" -R "$SENDER" $EAL_OPTS_SEC -- $SENDER_APP_OPTS
 SENDER_EXIT=$?
 set -e
 if [ $SENDER_EXIT -ne 0 ]; then

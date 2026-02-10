@@ -64,6 +64,8 @@ static char     g_file_prefix[32] = "iqdemo";
 static int      g_use_shm       = 0;
 static char     g_dest_addr[64] = "127.0.0.1";
 static uint16_t g_dest_port     = 50000;
+static int      g_eob_on_exit   = 0;  /* send context packet with EOB on exit */
+static int      g_eos_on_exit   = 0;  /* send context packet with EOS on exit */
 
 static struct rte_ring *g_rings[IQ_MAX_STREAMS];
 static struct rte_ring *g_free_ring;
@@ -88,11 +90,14 @@ static uint8_t *g_shm_difi_bufs[IQ_MAX_STREAMS];
 /* Pre-allocated DIFI header buffers for mbuf path (one per stream); used with sendmsg iovec to avoid touching mbuf payload */
 static uint8_t *g_mbuf_header_bufs[IQ_MAX_STREAMS];
 
-/* Per-stream stats */
-static uint64_t g_sent[IQ_MAX_STREAMS];
+/* Per-stream stats: inbound = dequeued from rings, outbound = sent over UDP */
+static uint64_t g_dequeued[IQ_MAX_STREAMS];  /* inbound: chunks received from producer */
+static uint64_t g_sent[IQ_MAX_STREAMS];     /* outbound: DIFI packets sent */
 static uint64_t g_seq_errors[IQ_MAX_STREAMS];
 static uint64_t g_last_tsc;
+static uint64_t g_last_dequeued_total;
 static uint64_t g_last_sent_total;
+static uint64_t g_start_tsc;  /* TSC at start of consumer loop (for duration) */
 
 static int parse_app_args(int argc, char **argv)
 {
@@ -119,6 +124,10 @@ static int parse_app_args(int argc, char **argv)
 			} else {
 				snprintf(g_dest_addr, sizeof(g_dest_addr), "%s", dest);
 			}
+		} else if (strcmp(argv[i], "--eob-on-exit") == 0) {
+			g_eob_on_exit = 1;
+		} else if (strcmp(argv[i], "--eos-on-exit") == 0) {
+			g_eos_on_exit = 1;
 		}
 	}
 	return 0;
@@ -194,6 +203,78 @@ static int send_packet(const uint8_t *buf, uint32_t total_len)
 		return -1;
 	}
 	return 0;
+}
+
+/* Send one DIFI context packet per stream with optional EOB/EOS in SEI (on exit). */
+static void send_sei_context_packets_on_exit(void)
+{
+	uint8_t ctx_buf[256];
+	difi_context_t ctx;
+	difi_result_t res;
+	size_t len;
+	uint16_t s;
+
+	for (s = 0; s < g_streams; s++) {
+		uint32_t stream_id = (uint32_t)s;
+		res = difi_init_standard_context(
+			&ctx,
+			stream_id,
+			0,                                    /* reference_point */
+			(uint64_t)IQ_DEFAULT_SAMPLE_RATE_HZ,  /* bandwidth_hz */
+			0,                                    /* if_ref_hz */
+			2400000000ULL,                        /* rf_ref_hz */
+			0,                                    /* if_band_offset_hz */
+			(int16_t)(-30.0 * 256),               /* reference_level_dbm */
+			(int16_t)(20.0 * 256),                /* gain_db */
+			(uint64_t)IQ_DEFAULT_SAMPLE_RATE_HZ,  /* sample_rate_hz */
+			0, 0, 0,                              /* ts_adjust_ps, ts_cal_time_s, state_event_flags */
+			(uint16_t)DIFI_PAYLOAD_FORMAT_I8);
+		if (res != DIFI_OK)
+			continue;
+		if (g_eob_on_exit)
+			difi_context_set_eob(&ctx, true);
+		if (g_eos_on_exit)
+			difi_context_set_eos(&ctx, true);
+		if (!g_eob_on_exit && !g_eos_on_exit)
+			continue;
+		res = difi_pack_context_class0(&ctx, ctx_buf, sizeof(ctx_buf), &len);
+		if (res != DIFI_OK)
+			continue;
+		send_packet(ctx_buf, (uint32_t)len);
+	}
+}
+
+/* Send one standard context packet per stream at startup so difi_recv knows payload is 8-bit before first data. */
+static void send_startup_context_packets(void)
+{
+	uint8_t ctx_buf[256];
+	difi_context_t ctx;
+	difi_result_t res;
+	size_t len;
+	uint16_t s;
+
+	for (s = 0; s < g_streams; s++) {
+		uint32_t stream_id = (uint32_t)s;
+		res = difi_init_standard_context(
+			&ctx,
+			stream_id,
+			0,                                    /* reference_point */
+			(uint64_t)IQ_DEFAULT_SAMPLE_RATE_HZ,  /* bandwidth_hz */
+			0,                                    /* if_ref_hz */
+			2400000000ULL,                        /* rf_ref_hz */
+			0,                                    /* if_band_offset_hz */
+			(int16_t)(-30.0 * 256),               /* reference_level_dbm */
+			(int16_t)(20.0 * 256),                /* gain_db */
+			(uint64_t)IQ_DEFAULT_SAMPLE_RATE_HZ,  /* sample_rate_hz */
+			0, 0, 0,                              /* ts_adjust_ps, ts_cal_time_s, state_event_flags */
+			(uint16_t)DIFI_PAYLOAD_FORMAT_I8);
+		if (res != DIFI_OK)
+			continue;
+		res = difi_pack_context_class0(&ctx, ctx_buf, sizeof(ctx_buf), &len);
+		if (res != DIFI_OK)
+			continue;
+		send_packet(ctx_buf, (uint32_t)len);
+	}
 }
 
 /* Zero-copy send: header (pre-filled buffer) + payload (pointer into mbuf) via sendmsg iovec. No memcpy. */
@@ -279,7 +360,7 @@ int main(int argc, char **argv)
 	if (!g_use_shm) {
 		iq_mempool_name(g_file_prefix, name, sizeof(name));
 		if (!rte_pktmbuf_pool_create(name, MBUF_POOL_SIZE, 0, 0,
-				MBUF_DATA_SIZE + RTE_PKTMBUF_HEADROOM, rte_socket_id()))
+				MBUF_DATA_SIZE, rte_socket_id()))
 			rte_exit(EXIT_FAILURE, "mempool create failed: %s\n", rte_strerror(rte_errno));
 		/* Pre-allocate and pre-fill one DIFI header buffer per stream for zero-copy sendmsg (no write into mbuf) */
 		for (s = 0; s < g_streams; s++) {
@@ -316,7 +397,7 @@ int main(int argc, char **argv)
 			rte_exit(EXIT_FAILURE, "mmap shm at %p failed (try setarch for same VA)\n", (void *)IQ_SHM_BASE_VA);
 		iq_free_ring_name(g_file_prefix, name, sizeof(name));
 		g_free_ring = rte_ring_create(name, (unsigned)IQ_SHM_N_SLOTS, rte_socket_id(),
-			RING_F_SP_ENQ | RING_F_SC_DEQ);
+			RING_F_MP_RTS_ENQ | RING_F_MC_RTS_DEQ);
 		if (!g_free_ring)
 			rte_exit(EXIT_FAILURE, "free ring create failed: %s\n", rte_strerror(rte_errno));
 		for (uint32_t i = 0; i < IQ_SHM_N_SLOTS; i++) {
@@ -336,14 +417,23 @@ int main(int argc, char **argv)
 		}
 	}
 
+	memset(g_dequeued, 0, sizeof(g_dequeued));
 	memset(g_sent, 0, sizeof(g_sent));
 	memset(g_seq_errors, 0, sizeof(g_seq_errors));
 	g_last_tsc = rte_rdtsc();
+	g_start_tsc = g_last_tsc;
+	g_last_dequeued_total = 0;
 	g_last_sent_total = 0;
 
-	printf("difi_dpdk_receiver (primary): streams=%u chunk_ms=%u dest=%s:%u%s\n",
+	printf("difi_dpdk_receiver (primary): streams=%u chunk_ms=%u dest=%s:%u%s%s%s\n",
 		(unsigned)g_streams, (unsigned)g_chunk_ms, g_dest_addr, (unsigned)g_dest_port,
-		g_use_shm ? " (shm)" : "");
+		g_use_shm ? " (shm)" : "",
+		g_eob_on_exit ? " eob-on-exit" : "",
+		g_eos_on_exit ? " eos-on-exit" : "");
+
+	/* Send one standard context per stream so difi_recv knows payload is 8-bit before first data */
+	if (g_udp_sock >= 0)
+		send_startup_context_packets();
 
 	/* Consumer loop: dequeue, fill DIFI header in-place, send over UDP */
 	while (!g_quit) {
@@ -351,6 +441,8 @@ int main(int argc, char **argv)
 			void *obj;
 			if (rte_ring_sc_dequeue(g_rings[s], &obj) != 0)
 				continue;
+
+			g_dequeued[s]++;  /* inbound: chunk received from producer */
 
 			if (g_use_shm) {
 				uint32_t slot_id = (uint32_t)(uintptr_t)obj;
@@ -401,30 +493,85 @@ int main(int argc, char **argv)
 			}
 		}
 
-		/* Stats every 1 second */
+		/* Stats every 1 second: inbound (dequeued) and outbound (sent) */
 		{
 			uint64_t tsc_now = rte_rdtsc();
 			if (tsc_now - g_last_tsc >= tsc_hz) {
-				uint64_t total = 0;
-				for (s = 0; s < g_streams; s++)
-					total += g_sent[s];
+				uint64_t total_dq = 0, total_sent = 0;
+				for (s = 0; s < g_streams; s++) {
+					total_dq += g_dequeued[s];
+					total_sent += g_sent[s];
+				}
 				double sec = (double)(tsc_now - g_last_tsc) / (double)tsc_hz;
-				uint64_t d = total - g_last_sent_total;
+				uint64_t d_dq = total_dq - g_last_dequeued_total;
+				uint64_t d_sent = total_sent - g_last_sent_total;
 				g_last_tsc = tsc_now;
-				g_last_sent_total = total;
-				printf("DIFI RX: sent %" PRIu64 "/s (dest %s:%u)\n",
-					(uint64_t)((double)d / sec), g_dest_addr, (unsigned)g_dest_port);
+				g_last_dequeued_total = total_dq;
+				g_last_sent_total = total_sent;
+				printf("DIFI RX: inbound %" PRIu64 "/s, outbound %" PRIu64 "/s (dest %s:%u)\n",
+					(uint64_t)((double)d_dq / sec), (uint64_t)((double)d_sent / sec),
+					g_dest_addr, (unsigned)g_dest_port);
 			}
 		}
 	}
 
-	/* Final summary */
+	/* Optional: send context packets with EOB/EOS before exit */
+	if (g_udp_sock >= 0 && (g_eob_on_exit || g_eos_on_exit))
+		send_sei_context_packets_on_exit();
+
+	/* Final summary and performance metrics: inbound vs outbound */
 	{
-		uint64_t total = 0;
-		for (s = 0; s < g_streams; s++)
-			total += g_sent[s];
+		uint64_t total_dequeued = 0, total_sent = 0;
+		for (s = 0; s < g_streams; s++) {
+			total_dequeued += g_dequeued[s];
+			total_sent += g_sent[s];
+		}
+		uint64_t end_tsc = rte_rdtsc();
+		uint64_t duration_tsc = (end_tsc > g_start_tsc) ? (end_tsc - g_start_tsc) : 0;
+		double duration_sec = (double)duration_tsc / (double)tsc_hz;
+
+		/* Inbound: chunks from producer (ring payload = header + payload) */
+		uint64_t inbound_bytes = total_dequeued * (uint64_t)(sizeof(struct iq_chunk_hdr) + g_payload_bytes);
+		uint64_t inbound_payload = total_dequeued * (uint64_t)g_payload_bytes;
+		double inbound_pps = (duration_sec > 0.0) ? ((double)total_dequeued / duration_sec) : 0.0;
+		double inbound_mbps_wire = (duration_sec > 0.0) ? ((double)inbound_bytes * 8.0 / 1e6 / duration_sec) : 0.0;
+		double inbound_mbps_payload = (duration_sec > 0.0) ? ((double)inbound_payload * 8.0 / 1e6 / duration_sec) : 0.0;
+
+		/* Outbound: DIFI packets sent over UDP */
+		uint64_t outbound_bytes = total_sent * (DIFI_HEADER_BYTES + g_payload_bytes);
+		uint64_t outbound_payload = total_sent * (uint64_t)g_payload_bytes;
+		double outbound_pps = (duration_sec > 0.0) ? ((double)total_sent / duration_sec) : 0.0;
+		double outbound_mbps_wire = (duration_sec > 0.0) ? ((double)outbound_bytes * 8.0 / 1e6 / duration_sec) : 0.0;
+		double outbound_mbps_payload = (duration_sec > 0.0) ? ((double)outbound_payload * 8.0 / 1e6 / duration_sec) : 0.0;
+
+		double theoretical_mbps = (double)IQ_DEFAULT_SAMPLE_RATE_HZ * 2.0 * (double)g_streams * 8.0 / 1e6;
+		double utilization_pct = (theoretical_mbps > 0.0) ? (100.0 * outbound_mbps_payload / theoretical_mbps) : 0.0;
+
 		printf("\n=== difi_dpdk_receiver final ===\n");
-		printf("Total DIFI packets sent %" PRIu64 "\n", total);
+		printf("Duration:         %.3f s\n\n", duration_sec);
+
+		printf("--- Inbound (from producer, ring dequeue) ---\n");
+		printf("Chunks:           %" PRIu64 "\n", total_dequeued);
+		printf("Bytes:            %" PRIu64 " (wire), %" PRIu64 " (payload)\n", inbound_bytes, inbound_payload);
+		printf("Throughput:       %.1f chunks/s, %.2f Mbps (wire), %.2f Mbps (payload)\n\n",
+			inbound_pps, inbound_mbps_wire, inbound_mbps_payload);
+
+		printf("--- Outbound (to network, UDP send) ---\n");
+		printf("Packets sent:     %" PRIu64 "\n", total_sent);
+		printf("Bytes sent:      %" PRIu64 " (wire), %" PRIu64 " (payload)\n", outbound_bytes, outbound_payload);
+		printf("Throughput:       %.1f packets/s, %.2f Mbps (wire), %.2f Mbps (payload)\n",
+			outbound_pps, outbound_mbps_wire, outbound_mbps_payload);
+		printf("Theoretical:      %.2f Mbps (%.0f Msps x 2 B x %u streams); utilization %.1f%%\n\n",
+			theoretical_mbps, (double)IQ_DEFAULT_SAMPLE_RATE_HZ / 1e6, (unsigned)g_streams, utilization_pct);
+
+		if (g_streams <= 16) {
+			printf("Per-stream inbound (dequeued): ");
+			for (s = 0; s < g_streams; s++)
+				printf("%" PRIu64 "%s", g_dequeued[s], (s + 1 < g_streams) ? ", " : "\n");
+			printf("Per-stream outbound (sent):   ");
+			for (s = 0; s < g_streams; s++)
+				printf("%" PRIu64 "%s", g_sent[s], (s + 1 < g_streams) ? ", " : "\n");
+		}
 	}
 
 	if (g_udp_sock >= 0)

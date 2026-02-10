@@ -26,21 +26,23 @@ Same as module_b: ensure hugepages are configured before first run (e.g. `echo 1
 
 Start **difi_dpdk_receiver first** (primary), then start the sender (secondary) with the same EAL options. Use setarch if you see ASLR warnings.
 
-**Terminal 1 (primary):**
+**Terminal 1 (primary) – start this first with setarch and `-m 512`:**
 
 ```bash
 sudo setarch $(uname -m) -R ./build/difi_dpdk_receiver \
-  --proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -- \
+  --proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
   --streams 16 --chunk-ms 2 --dest 127.0.0.1:50000
 ```
 
-**Terminal 2 (secondary, after primary is running):**
+**Terminal 2 (secondary) – same EAL options including `-m 512`:**
 
 ```bash
 sudo setarch $(uname -m) -R ./sender_C_example/build/sender_C_example \
-  --proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -- \
+  --proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
   --streams 16 --chunk-ms 2
 ```
+
+**If sender_C_example segfaults:** The primary must be started **with setarch first** so its memory is at a fixed address. Use the **exact same** EAL options on both (including `-m 512`). Or use **`--use-shm`** for both to avoid shared mempool mapping: add `--use-shm` after `--chunk-ms 2` on both commands; then setarch is still recommended but the segfault from ASLR is avoided.
 
 ### Application options (after `--`)
 
@@ -51,6 +53,12 @@ sudo setarch $(uname -m) -R ./sender_C_example/build/sender_C_example \
 | `--file-prefix P` | Prefix for ring/mempool names (match sender) | iqdemo |
 | `--dest host:port` | UDP destination for DIFI packets | 127.0.0.1:50000 |
 | `--use-shm` | Use POSIX shm for chunk data (NXP/ARM compatibility) | off |
+| `--eob-on-exit` | On exit, send one DIFI context packet per stream with End-of-Burst (SEI) set | off |
+| `--eos-on-exit` | On exit, send one DIFI context packet per stream with End-of-Stream (SEI) set | off |
+
+On exit, the application prints performance metrics separately for **inbound** (chunks dequeued from producer rings) and **outbound** (DIFI packets sent over UDP): chunk/packet counts, bytes (wire and payload), throughput (chunks/packets per second and Mbps), and per-stream breakdown. Outbound section includes theoretical rate and utilization %.
+
+**Throughput:** Theoretical payload rate is 7.68 Msps × 2 bytes/sample (8-bit I+Q) × 16 streams ≈ **1966 Mbps**. Achieved rate can be lower because (1) the sender is real-time rate-limited (one chunk per stream every `chunk_ms`), so max packet rate is 8000/s for 16 streams at 2 ms chunks; (2) the single-threaded receiver may not drain the rings at 8000/s, so the pipeline runs at the slower of the two. The sender supports **`--workers N`** to partition streams across N lcores (give at least N lcores via EAL, e.g. `-l 0,1,2,3` for 4 workers); with rate limit this can approach 8000/s. To approach 2 Gbps, run the sender with **`--no-rate-limit`** and ensure the receiver keeps up (e.g. sufficient CPU); both must sustain ~8000 packets/s.
 
 EAL options (before `--`) must match the sender: `--proc-type=primary`, `--file-prefix`, `--base-virtaddr`, `--legacy-mem`.
 
@@ -64,6 +72,58 @@ sudo ./difi_dpdk_receiver/run_difi_receiver.sh
 ```
 
 See `run_difi_receiver.sh` in this directory for the exact commands.
+
+## Testing with difi_recv
+
+To verify the DIFI stream, run **difi_recv** (from DIFI_C_Lib) bound to the same IP:port that **difi_dpdk_receiver** sends to. Use three terminals. The receiver sends one standard context packet (PTYPE 0x4) per stream at startup with payload format 8-bit IQ so difi_recv reports correct sample count and data rate.
+
+**1. Build DIFI_C_Lib (if not already built):**
+
+```bash
+cd /path/to/DIFI_C_Lib
+mkdir -p build && cd build
+cmake ..
+make
+# difi_recv is at build/difi_recv
+```
+
+**2. Start difi_recv (receive DIFI on port 50000):**
+
+```bash
+# From DIFI_C_Lib/build – bind to port 50000 (default), quiet data logging optional
+./difi_recv --bind 0.0.0.0:50000
+
+# Less verbose (only context/version and stats): add -q
+./difi_recv --bind 0.0.0.0:50000 -q
+```
+
+Leave this running. It will print decoded context/version packets and data-packet info (stream ID, sequence, timestamps, IQ count, optional loss).
+
+**3. Start difi_dpdk_receiver (primary) – with setarch and `-m 512`:**
+
+```bash
+# From DIFI_API
+sudo setarch $(uname -m) -R ./difi_dpdk_receiver/build/difi_dpdk_receiver \
+  --proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
+  --streams 16 --chunk-ms 2 --dest 127.0.0.1:50000
+```
+
+**4. Start sender_C_example (secondary) – same EAL options:**
+
+```bash
+sudo setarch $(uname -m) -R ./sender_C_example/build/sender_C_example \
+  --proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
+  --streams 16 --chunk-ms 2
+```
+
+If the sender segfaults, see **“If sender_C_example segfaults”** in the Run section above, or use the script: `sudo ./difi_dpdk_receiver/run_difi_receiver.sh` (it uses `--use-shm` and setarch for both).
+
+**What you should see**
+
+- **difi_dpdk_receiver:** “DIFI RX: sent N/s (dest 127.0.0.1:50000)” every second.
+- **difi_recv:** Data packets (e.g. stream ID, seq, sample count); with 8-bit IQ it will decode as I8. Use `-q` to reduce per-packet data logs; use `-o out.raw` to write I/Q to a file.
+
+**Stop order:** Ctrl+C **sender_C_example** first, then **difi_dpdk_receiver**, then **difi_recv**.
 
 ## Output
 
