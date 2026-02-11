@@ -1,0 +1,86 @@
+/**
+ * Common definitions for IQ streaming prototype (Module A and Module B).
+ * This file is duplicated in both projects; keep contents identical.
+ */
+#ifndef IQ_COMMON_H
+#define IQ_COMMON_H
+
+#include <stdint.h>
+#include <stdio.h>
+#include <rte_common.h>
+
+/* -------------------------------------------------------------------------
+ * Chunk header: at start of each IQ chunk payload in an mbuf.
+ * Packed to avoid padding; both producer and consumer must use same layout.
+ * ------------------------------------------------------------------------- */
+#define IQ_CHUNK_MAGIC  0x48435149u  /* "IQCH" (I=0x49 Q=0x51 C=0x43 H=0x48) LE */
+#define IQ_CHUNK_VERSION 1u
+
+#define IQ_DEFAULT_SAMPLE_RATE_HZ  7680000u   /* 7.68 Msps */
+#define IQ_DEFAULT_CHUNK_MS        2u
+#define IQ_MAX_STREAMS             16u
+
+struct iq_chunk_hdr {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t stream_id;
+	uint64_t seq;
+	uint64_t timestamp_ns;
+	uint32_t payload_len;
+	uint32_t reserved;
+} __attribute__((__packed__));
+
+/* -------------------------------------------------------------------------
+ * Naming: ring and mempool names must match between primary and secondary.
+ * ------------------------------------------------------------------------- */
+static inline void iq_mempool_name(const char *prefix, char *out, unsigned out_len)
+{
+	snprintf(out, (size_t)out_len, "%s_mbuf", prefix);
+}
+
+static inline void iq_ring_name(const char *prefix, uint16_t stream_id, char *out, unsigned out_len)
+{
+	snprintf(out, (size_t)out_len, "%s_ring_%u", prefix, (unsigned)stream_id);
+}
+
+#define IQ_SHM_SLOT_SIZE  65536u
+#define IQ_SHM_N_SLOTS    512u
+#define IQ_SHM_BASE_VA    ((uintptr_t)0x3000000000ULL)
+
+static inline void iq_shm_name(const char *prefix, char *out, unsigned out_len)
+{
+	snprintf(out, (size_t)out_len, "/%s_chunks", prefix);
+}
+
+static inline void iq_free_ring_name(const char *prefix, char *out, unsigned out_len)
+{
+	snprintf(out, (size_t)out_len, "%s_free", prefix);
+}
+
+static inline uint32_t iq_samples_per_chunk(uint32_t sample_rate_hz, uint32_t chunk_ms)
+{
+	return (uint32_t)(((uint64_t)sample_rate_hz * (uint64_t)chunk_ms + 500u) / 1000u);
+}
+
+/* Chunk duration in microseconds; samples = round(rate_hz * chunk_us / 1e6) */
+static inline uint32_t iq_samples_per_chunk_us(uint32_t sample_rate_hz, uint32_t chunk_us)
+{
+	return (uint32_t)(((uint64_t)sample_rate_hz * (uint64_t)chunk_us + 500000u) / 1000000u);
+}
+
+static inline uint32_t iq_payload_bytes(uint32_t samples_per_chunk)
+{
+	return samples_per_chunk * 2u;
+}
+
+static inline uint32_t iq_total_chunk_bytes(uint32_t payload_bytes)
+{
+	return (uint32_t)sizeof(struct iq_chunk_hdr) + payload_bytes;
+}
+
+static inline uint8_t iq_payload_byte_at(uint16_t stream_id, uint64_t seq, uint32_t i)
+{
+	return (uint8_t)((stream_id & 0xFFu) ^ (uint8_t)(seq & 0xFFu) ^ (uint8_t)(i & 0xFFu));
+}
+
+#endif /* IQ_COMMON_H */
