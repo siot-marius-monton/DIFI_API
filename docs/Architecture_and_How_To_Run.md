@@ -110,23 +110,25 @@ The script:
 
 **Order:** Start the **primary first**. The secondary blocks in EAL init until it can attach to the primary.
 
-**Terminal 1 – primary:**
+**Recommended: run each process on a separate CPU core** using the EAL option `-l` (lcore list). Use **`-l 0`** for the receiver and **`-l 1`** for the sender. This avoids contention and gives zero dropped packets; **16 streams with 1 worker** run fine with no drops.
+
+**Terminal 1 – primary (pin to core 0):**
 
 ```bash
 sudo setarch $(uname -m) -R ./difi_dpdk_receiver/build/difi_dpdk_receiver \
-  --proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
+  --proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -l 0 -- \
   --streams 16 --chunk-ms 2 --use-shm --dest 127.0.0.1:50000
 ```
 
-**Terminal 2 – secondary (after primary is up):**
+**Terminal 2 – secondary (after primary is up; pin to core 1):**
 
 ```bash
 sudo setarch $(uname -m) -R ./sender_C_example/build/sender_C_example \
-  --proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
+  --proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -l 1 -- \
   --streams 16 --chunk-ms 2 --use-shm
 ```
 
-EAL options (before `--`) must match on both processes. The `-R` flag disables ASLR so the secondary can map the primary’s memory; without it the secondary may segfault.
+EAL memory options (before `--`) must match on both processes; the **`-l`** value can and should differ so each process has its own core. The `-R` flag disables ASLR so the secondary can map the primary’s memory; without it the secondary may segfault.
 
 ### 5.3. EAL and application options
 
@@ -136,7 +138,7 @@ EAL options (before `--`) must match on both processes. The `-R` flag disables A
 - `--file-prefix=iqdemo` — prefix for DPDK multi-process socket and resource names; must be identical on both.
 - `--base-virtaddr=0x2000000000` — base VA for DPDK memory; same on both.
 - `--legacy-mem -m 512` — hugepage memory; same on both.
-- **Multi-worker sender:** use at least N lcores, e.g. `-l 0,1,2,3` for 4 workers.
+- **`-l` (lcore list):** Use **separate cores** for primary and secondary (e.g. **`-l 0`** for receiver, **`-l 1`** for sender) to avoid contention and get zero drops. With this, 16 streams and 1 worker run fine. For a multi-worker sender, give the sender at least N lcores, e.g. `-l 1,2,3,4` for 4 workers (receiver can stay on `-l 0`).
 
 **Application (after `--`):**
 
@@ -148,7 +150,7 @@ EAL options (before `--`) must match on both processes. The `-R` flag disables A
 | `--dest host:port` | yes | no | UDP destination for DIFI packets. |
 | `--use-shm` | yes | yes | Use POSIX shm for chunk data (recommended on NXP/ARM). |
 | `--no-rate-limit` | no | yes | Sender produces at max rate (receiver must keep up). |
-| `--workers W` | no | yes | Sender worker threads (default 1); need W lcores in EAL. |
+| `--workers W` | no | yes | Sender worker threads (default 1); need W lcores in EAL. With receiver on `-l 0` and sender on `-l 1`, 16 streams and 1 worker run with zero drops. |
 
 ### 5.4. Multi-worker sender
 

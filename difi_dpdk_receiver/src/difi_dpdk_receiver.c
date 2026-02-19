@@ -21,6 +21,8 @@
 
 #include <rte_eal.h>
 #include <rte_errno.h>
+#include <rte_launch.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
@@ -60,12 +62,14 @@ static void sigint_handler(int sig)
 /* App options */
 static uint16_t g_streams       = 16;
 static uint32_t g_chunk_ms      = IQ_DEFAULT_CHUNK_MS;
+static uint32_t g_samples_per_chunk = 0;  /* if > 0, use directly (overrides chunk_ms) */
 static char     g_file_prefix[32] = "iqdemo";
 static int      g_use_shm       = 0;
 static char     g_dest_addr[64] = "127.0.0.1";
 static uint16_t g_dest_port     = 50000;
 static int      g_eob_on_exit   = 0;  /* send context packet with EOB on exit */
 static int      g_eos_on_exit   = 0;  /* send context packet with EOS on exit */
+static int      g_no_send       = 0;  /* if set, drain rings but do not send UDP (for bottleneck testing) */
 
 static struct rte_ring *g_rings[IQ_MAX_STREAMS];
 static struct rte_ring *g_free_ring;
@@ -107,6 +111,8 @@ static int parse_app_args(int argc, char **argv)
 			if (g_streams > IQ_MAX_STREAMS) g_streams = IQ_MAX_STREAMS;
 		} else if (strcmp(argv[i], "--chunk-ms") == 0 && i + 1 < argc) {
 			g_chunk_ms = (uint32_t)atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--samples-per-chunk") == 0 && i + 1 < argc) {
+			g_samples_per_chunk = (uint32_t)atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--file-prefix") == 0 && i + 1 < argc) {
 			snprintf(g_file_prefix, sizeof(g_file_prefix), "%s", argv[++i]);
 		} else if (strcmp(argv[i], "--use-shm") == 0) {
@@ -128,6 +134,8 @@ static int parse_app_args(int argc, char **argv)
 			g_eob_on_exit = 1;
 		} else if (strcmp(argv[i], "--eos-on-exit") == 0) {
 			g_eos_on_exit = 1;
+		} else if (strcmp(argv[i], "--no-send") == 0) {
+			g_no_send = 1;
 		}
 	}
 	return 0;
@@ -196,6 +204,8 @@ static inline void write_difi_header_variable(uint8_t *buf, uint32_t stream_id, 
 /* Send one DIFI packet (header already written in buf); buf is total_len bytes */
 static int send_packet(const uint8_t *buf, uint32_t total_len)
 {
+	if (g_no_send)
+		return 0;
 	ssize_t n = sendto(g_udp_sock, buf, (size_t)total_len, 0,
 	                   (const struct sockaddr *)&g_dest_saddr, sizeof(g_dest_saddr));
 	if (n < 0 || (uint32_t)n != total_len) {
@@ -279,8 +289,10 @@ static void send_startup_context_packets(void)
 
 /* Zero-copy send: header (pre-filled buffer) + payload (pointer into mbuf) via sendmsg iovec. No memcpy. */
 static int send_packet_iov(const uint8_t *header, uint32_t header_len,
-                           const uint8_t *payload, uint32_t payload_len)
+	const uint8_t *payload, uint32_t payload_len)
 {
+	if (g_no_send)
+		return 0;
 	struct iovec iov[2];
 	iov[0].iov_base = (void *)header;
 	iov[0].iov_len  = (size_t)header_len;
@@ -329,7 +341,10 @@ int main(int argc, char **argv)
 	if (app_argv)
 		parse_app_args(app_argc, app_argv);
 
-	samples_per_chunk = iq_samples_per_chunk(sample_rate_hz, g_chunk_ms);
+	if (g_samples_per_chunk > 0)
+		samples_per_chunk = g_samples_per_chunk;
+	else
+		samples_per_chunk = iq_samples_per_chunk(sample_rate_hz, g_chunk_ms);
 	g_payload_bytes   = iq_payload_bytes(samples_per_chunk);
 	g_total_chunk_bytes = iq_total_chunk_bytes(g_payload_bytes);
 
@@ -344,7 +359,7 @@ int main(int argc, char **argv)
 
 	if (g_total_chunk_bytes > MBUF_DATA_SIZE) {
 		rte_exit(EXIT_FAILURE,
-			"Chunk size %u > mbuf data size %u; reduce --chunk-ms\n",
+			"Chunk size %u > mbuf data size %u; reduce --chunk-ms or --samples-per-chunk\n",
 			(unsigned)g_total_chunk_bytes, (unsigned)MBUF_DATA_SIZE);
 	}
 	if (g_use_shm && g_total_chunk_bytes > IQ_SHM_SLOT_SIZE) {
@@ -353,9 +368,13 @@ int main(int argc, char **argv)
 			(unsigned)g_total_chunk_bytes, (unsigned)IQ_SHM_SLOT_SIZE);
 	}
 
-	g_udp_sock = open_udp_socket();
-	if (g_udp_sock < 0)
-		rte_exit(EXIT_FAILURE, "Failed to open UDP socket\n");
+	if (!g_no_send) {
+		g_udp_sock = open_udp_socket();
+		if (g_udp_sock < 0)
+			rte_exit(EXIT_FAILURE, "Failed to open UDP socket\n");
+	} else {
+		g_udp_sock = -1;
+	}
 
 	if (!g_use_shm) {
 		iq_mempool_name(g_file_prefix, name, sizeof(name));
@@ -425,11 +444,12 @@ int main(int argc, char **argv)
 	g_last_dequeued_total = 0;
 	g_last_sent_total = 0;
 
-	printf("difi_dpdk_receiver (primary): streams=%u chunk_ms=%u dest=%s:%u%s%s%s\n",
-		(unsigned)g_streams, (unsigned)g_chunk_ms, g_dest_addr, (unsigned)g_dest_port,
+	printf("difi_dpdk_receiver (primary): streams=%u samples_per_chunk=%u dest=%s:%u%s%s%s%s\n",
+		(unsigned)g_streams, (unsigned)samples_per_chunk, g_dest_addr, (unsigned)g_dest_port,
 		g_use_shm ? " (shm)" : "",
 		g_eob_on_exit ? " eob-on-exit" : "",
-		g_eos_on_exit ? " eos-on-exit" : "");
+		g_eos_on_exit ? " eos-on-exit" : "",
+		g_no_send ? " NO-SEND (drain only)" : "");
 
 	/* Send one standard context per stream so difi_recv knows payload is 8-bit before first data */
 	if (g_udp_sock >= 0)

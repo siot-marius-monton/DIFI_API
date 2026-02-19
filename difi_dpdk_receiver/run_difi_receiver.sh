@@ -4,6 +4,7 @@
 #   sudo ./difi_dpdk_receiver/run_difi_receiver.sh
 # Optional: DIFI_DEST=host:port (default 127.0.0.1:50000)
 # Optional: DIFI_MAX_RATE=1 to run sender with --no-rate-limit (max throughput; receiver must keep up)
+# Receiver runs on lcore 0, sender on lcore 1 (separate cores = zero drops with 16 streams, 1 worker).
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -16,8 +17,8 @@ case "$ARCH" in
 esac
 
 EAL_MEM="-m 512"
-EAL_OPTS="--proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem $EAL_MEM"
-EAL_OPTS_SEC="--proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem $EAL_MEM"
+EAL_OPTS="--proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem $EAL_MEM -l 0"
+EAL_OPTS_SEC="--proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem $EAL_MEM -l 1"
 APP_OPTS="--streams 16 --chunk-ms 2 --use-shm"
 DEST="${DIFI_DEST:-127.0.0.1:50000}"
 SENDER_APP_OPTS="$APP_OPTS"
