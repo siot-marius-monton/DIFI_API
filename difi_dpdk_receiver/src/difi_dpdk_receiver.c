@@ -3,7 +3,9 @@
  * SPSC ring per stream; dequeues IQ chunks, overwrites the chunk header with
  * a DIFI data header (zero-copy for payload), and sends DIFI over UDP.
  * Data: 8-bit IQ at 7.68 Msps, up to 16 streams.
+ * Uses sendmmsg() to send one packet per stream in a single syscall (batch).
  */
+#define _GNU_SOURCE
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -36,6 +38,22 @@
 #define MBUF_DATA_SIZE    65535
 
 #define DIFI_HEADER_BYTES  32
+
+/* Dedicated send core: pool of contiguous buffers for drain -> send_ring -> send worker.
+ * DPDK ring capacity is count-1; use ring size > pool size so initial fill of pool_ring succeeds. */
+#define SEND_POOL_SIZE    4096
+#define SEND_RING_SIZE    8192
+#define SEND_BATCH_MAX    16
+
+struct send_item {
+	uint8_t  *buf;
+	uint16_t  stream_id;
+};
+
+static struct send_item *g_send_pool;
+static struct rte_ring *g_pool_ring;   /* available send_items (send worker produces, drain consumes) */
+static struct rte_ring *g_send_ring;   /* to-send (drain produces, send worker consumes) */
+static uint32_t g_packet_len;          /* DIFI_HEADER_BYTES + g_payload_bytes for copy */
 
 /* Big-endian stores (used in hot path; no difi_fill_data_header_i8) */
 static inline void store_be32(uint8_t *p, uint32_t val)
@@ -102,6 +120,7 @@ static uint64_t g_last_tsc;
 static uint64_t g_last_dequeued_total;
 static uint64_t g_last_sent_total;
 static uint64_t g_start_tsc;  /* TSC at start of consumer loop (for duration) */
+static uint64_t g_tsc_in_send_interval;  /* TSC ticks spent in send_packet/send_packet_iov during current 1s interval (Step 3 bottleneck) */
 
 static int parse_app_args(int argc, char **argv)
 {
@@ -206,8 +225,10 @@ static int send_packet(const uint8_t *buf, uint32_t total_len)
 {
 	if (g_no_send)
 		return 0;
+	uint64_t tsc_before = rte_rdtsc();
 	ssize_t n = sendto(g_udp_sock, buf, (size_t)total_len, 0,
 	                   (const struct sockaddr *)&g_dest_saddr, sizeof(g_dest_saddr));
+	g_tsc_in_send_interval += (rte_rdtsc() - tsc_before);
 	if (n < 0 || (uint32_t)n != total_len) {
 		if (n < 0) perror("sendto");
 		return -1;
@@ -293,6 +314,7 @@ static int send_packet_iov(const uint8_t *header, uint32_t header_len,
 {
 	if (g_no_send)
 		return 0;
+	uint64_t tsc_before = rte_rdtsc();
 	struct iovec iov[2];
 	iov[0].iov_base = (void *)header;
 	iov[0].iov_len  = (size_t)header_len;
@@ -306,10 +328,54 @@ static int send_packet_iov(const uint8_t *header, uint32_t header_len,
 	msg.msg_iovlen  = 2;
 
 	ssize_t n = sendmsg(g_udp_sock, &msg, 0);
+	g_tsc_in_send_interval += (rte_rdtsc() - tsc_before);
 	uint32_t total = header_len + payload_len;
 	if (n < 0 || (uint32_t)n != total) {
 		if (n < 0) perror("sendmsg");
 		return -1;
+	}
+	return 0;
+}
+
+/* Dedicated send core: dequeue from g_send_ring, sendmmsg in batches, return to g_pool_ring */
+static int send_worker(void *arg)
+{
+	(void)arg;
+	static struct mmsghdr msgvec[SEND_BATCH_MAX];
+	static struct iovec iovs[SEND_BATCH_MAX];
+	static struct send_item *batch_items[SEND_BATCH_MAX];
+	unsigned int n;
+
+	while (!g_quit || rte_ring_count(g_send_ring) > 0) {
+		n = 0;
+		while (n < SEND_BATCH_MAX) {
+			struct send_item *item;
+			if (rte_ring_sc_dequeue(g_send_ring, (void **)&item) != 0)
+				break;
+			batch_items[n] = item;
+			memset(&msgvec[n].msg_hdr, 0, sizeof(struct msghdr));
+			msgvec[n].msg_hdr.msg_name = (void *)&g_dest_saddr;
+			msgvec[n].msg_hdr.msg_namelen = sizeof(g_dest_saddr);
+			iovs[n].iov_base = item->buf;
+			iovs[n].iov_len  = (size_t)g_packet_len;
+			msgvec[n].msg_hdr.msg_iov = &iovs[n];
+			msgvec[n].msg_hdr.msg_iovlen = 1;
+			n++;
+		}
+		if (n == 0) {
+			if (!g_quit)
+				continue;
+			break;
+		}
+		uint64_t tsc_before = rte_rdtsc();
+		int sent = sendmmsg(g_udp_sock, msgvec, n, 0);
+		__atomic_fetch_add(&g_tsc_in_send_interval, (rte_rdtsc() - tsc_before), __ATOMIC_RELAXED);
+		for (int i = 0; i < sent; i++)
+			__atomic_fetch_add(&g_sent[batch_items[i]->stream_id], 1, __ATOMIC_RELAXED);
+		for (unsigned int i = 0; i < n; i++) {
+			while (rte_ring_sp_enqueue(g_pool_ring, batch_items[i]) != 0)
+				;
+		}
 	}
 	return 0;
 }
@@ -436,6 +502,36 @@ int main(int argc, char **argv)
 		}
 	}
 
+	g_packet_len = DIFI_HEADER_BYTES + g_payload_bytes;
+
+	unsigned int n_lcores = rte_lcore_count();
+	int use_dedicated_send = (n_lcores >= 2 && !g_no_send);
+
+	if (use_dedicated_send) {
+		g_send_pool = calloc(SEND_POOL_SIZE, sizeof(struct send_item));
+		if (!g_send_pool)
+			rte_exit(EXIT_FAILURE, "malloc send_pool failed\n");
+		for (unsigned int i = 0; i < SEND_POOL_SIZE; i++) {
+			g_send_pool[i].buf = malloc((size_t)g_packet_len);
+			if (!g_send_pool[i].buf)
+				rte_exit(EXIT_FAILURE, "malloc send_pool[%u].buf failed\n", i);
+		}
+		snprintf(name, sizeof(name), "%s_difi_pool", g_file_prefix);
+		g_pool_ring = rte_ring_create(name, SEND_RING_SIZE, rte_socket_id(),
+			RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (!g_pool_ring)
+			rte_exit(EXIT_FAILURE, "pool_ring create failed: %s\n", rte_strerror(rte_errno));
+		snprintf(name, sizeof(name), "%s_difi_send", g_file_prefix);
+		g_send_ring = rte_ring_create(name, SEND_RING_SIZE, rte_socket_id(),
+			RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (!g_send_ring)
+			rte_exit(EXIT_FAILURE, "send_ring create failed: %s\n", rte_strerror(rte_errno));
+		for (unsigned int i = 0; i < SEND_POOL_SIZE; i++) {
+			while (rte_ring_sp_enqueue(g_pool_ring, &g_send_pool[i]) != 0)
+				;
+		}
+	}
+
 	memset(g_dequeued, 0, sizeof(g_dequeued));
 	memset(g_sent, 0, sizeof(g_sent));
 	memset(g_seq_errors, 0, sizeof(g_seq_errors));
@@ -444,25 +540,44 @@ int main(int argc, char **argv)
 	g_last_dequeued_total = 0;
 	g_last_sent_total = 0;
 
-	printf("difi_dpdk_receiver (primary): streams=%u samples_per_chunk=%u dest=%s:%u%s%s%s%s\n",
+	printf("difi_dpdk_receiver (primary): streams=%u samples_per_chunk=%u dest=%s:%u%s%s%s%s%s\n",
 		(unsigned)g_streams, (unsigned)samples_per_chunk, g_dest_addr, (unsigned)g_dest_port,
 		g_use_shm ? " (shm)" : "",
 		g_eob_on_exit ? " eob-on-exit" : "",
 		g_eos_on_exit ? " eos-on-exit" : "",
-		g_no_send ? " NO-SEND (drain only)" : "");
+		g_no_send ? " NO-SEND (drain only)" : "",
+		use_dedicated_send ? " dedicated-send" : "");
 
 	/* Send one standard context per stream so difi_recv knows payload is 8-bit before first data */
 	if (g_udp_sock >= 0)
 		send_startup_context_packets();
 
-	/* Consumer loop: dequeue, fill DIFI header in-place, send over UDP */
+	__atomic_store_n(&g_tsc_in_send_interval, 0, __ATOMIC_RELAXED);
+
+	unsigned int send_lcore_id = RTE_MAX_LCORE;
+	if (use_dedicated_send) {
+		send_lcore_id = rte_get_next_lcore(rte_lcore_id(), 0, 0);
+		if (send_lcore_id >= RTE_MAX_LCORE)
+			rte_exit(EXIT_FAILURE, "need 2 lcores for dedicated send (e.g. -l 0,1)\n");
+		rte_eal_remote_launch(send_worker, NULL, send_lcore_id);
+	}
+
+	/* Batch for single-thread path (no dedicated send) */
+	static struct mmsghdr msgvec[IQ_MAX_STREAMS];
+	static struct iovec iovs[IQ_MAX_STREAMS][2];
+	static uint16_t batch_stream_ids[IQ_MAX_STREAMS];
+	static void *batch_objs[IQ_MAX_STREAMS];
+
+	/* Consumer loop */
 	while (!g_quit) {
-		for (s = 0; s < g_streams; s++) {
+		unsigned int batch_count = 0;
+
+		for (s = 0; s < g_streams && batch_count < IQ_MAX_STREAMS; s++) {
 			void *obj;
 			if (rte_ring_sc_dequeue(g_rings[s], &obj) != 0)
 				continue;
 
-			g_dequeued[s]++;  /* inbound: chunk received from producer */
+			g_dequeued[s]++;
 
 			if (g_use_shm) {
 				uint32_t slot_id = (uint32_t)(uintptr_t)obj;
@@ -484,9 +599,28 @@ int main(int argc, char **argv)
 				write_difi_header_variable(difi_buf, (uint32_t)hdr->stream_id,
 					(uint8_t)(hdr->seq & 0xF), ts_sec, ts_ps);
 				memcpy(difi_buf + DIFI_HEADER_BYTES, payload_ptr, g_payload_bytes);
-				if (send_packet(difi_buf, DIFI_HEADER_BYTES + g_payload_bytes) == 0)
-					g_sent[s]++;
-				rte_ring_sp_enqueue(g_free_ring, obj);
+
+				if (use_dedicated_send) {
+					struct send_item *item;
+					if (rte_ring_sc_dequeue(g_pool_ring, (void **)&item) == 0) {
+						memcpy(item->buf, difi_buf, (size_t)g_packet_len);
+						item->stream_id = s;
+						while (rte_ring_sp_enqueue(g_send_ring, item) != 0)
+							;
+					}
+					rte_ring_sp_enqueue(g_free_ring, obj);
+				} else {
+					batch_stream_ids[batch_count] = s;
+					batch_objs[batch_count] = obj;
+					memset(&msgvec[batch_count].msg_hdr, 0, sizeof(struct msghdr));
+					msgvec[batch_count].msg_hdr.msg_name = (void *)&g_dest_saddr;
+					msgvec[batch_count].msg_hdr.msg_namelen = sizeof(g_dest_saddr);
+					iovs[batch_count][0].iov_base = difi_buf;
+					iovs[batch_count][0].iov_len  = (size_t)g_packet_len;
+					msgvec[batch_count].msg_hdr.msg_iov = &iovs[batch_count][0];
+					msgvec[batch_count].msg_hdr.msg_iovlen = 1;
+					batch_count++;
+				}
 			} else {
 				struct rte_mbuf *chunk_mbuf = (struct rte_mbuf *)obj;
 				struct iq_chunk_hdr *hdr = rte_pktmbuf_mtod(chunk_mbuf, struct iq_chunk_hdr *);
@@ -507,33 +641,78 @@ int main(int argc, char **argv)
 				write_difi_header_variable(g_mbuf_header_bufs[s], (uint32_t)hdr->stream_id,
 					(uint8_t)(hdr->seq & 0xF), ts_sec, ts_ps);
 
-				if (send_packet_iov(g_mbuf_header_bufs[s], DIFI_HEADER_BYTES, payload_ptr, g_payload_bytes) == 0)
-					g_sent[s]++;
-				rte_pktmbuf_free(chunk_mbuf);
+				if (use_dedicated_send) {
+					struct send_item *item;
+					if (rte_ring_sc_dequeue(g_pool_ring, (void **)&item) == 0) {
+						memcpy(item->buf, g_mbuf_header_bufs[s], DIFI_HEADER_BYTES);
+						memcpy(item->buf + DIFI_HEADER_BYTES, payload_ptr, (size_t)g_payload_bytes);
+						item->stream_id = s;
+						while (rte_ring_sp_enqueue(g_send_ring, item) != 0)
+							;
+					}
+					rte_pktmbuf_free(chunk_mbuf);
+				} else {
+					batch_stream_ids[batch_count] = s;
+					batch_objs[batch_count] = (void *)chunk_mbuf;
+					memset(&msgvec[batch_count].msg_hdr, 0, sizeof(struct msghdr));
+					msgvec[batch_count].msg_hdr.msg_name = (void *)&g_dest_saddr;
+					msgvec[batch_count].msg_hdr.msg_namelen = sizeof(g_dest_saddr);
+					iovs[batch_count][0].iov_base = g_mbuf_header_bufs[s];
+					iovs[batch_count][0].iov_len  = DIFI_HEADER_BYTES;
+					iovs[batch_count][1].iov_base = payload_ptr;
+					iovs[batch_count][1].iov_len  = (size_t)g_payload_bytes;
+					msgvec[batch_count].msg_hdr.msg_iov = &iovs[batch_count][0];
+					msgvec[batch_count].msg_hdr.msg_iovlen = 2;
+					batch_count++;
+				}
 			}
 		}
 
-		/* Stats every 1 second: inbound (dequeued) and outbound (sent) */
+		if (!use_dedicated_send) {
+			if (batch_count > 0 && !g_no_send) {
+				uint64_t tsc_before = rte_rdtsc();
+				int sent = sendmmsg(g_udp_sock, msgvec, batch_count, 0);
+				__atomic_fetch_add(&g_tsc_in_send_interval, (rte_rdtsc() - tsc_before), __ATOMIC_RELAXED);
+				if (sent > 0) {
+					for (unsigned int i = 0; i < (unsigned int)sent && i < batch_count; i++)
+						g_sent[batch_stream_ids[i]]++;
+				}
+			}
+			for (unsigned int i = 0; i < batch_count; i++) {
+				if (g_use_shm)
+					rte_ring_sp_enqueue(g_free_ring, batch_objs[i]);
+				else
+					rte_pktmbuf_free((struct rte_mbuf *)batch_objs[i]);
+			}
+		}
+
+		/* Stats every 1 second */
 		{
 			uint64_t tsc_now = rte_rdtsc();
 			if (tsc_now - g_last_tsc >= tsc_hz) {
 				uint64_t total_dq = 0, total_sent = 0;
 				for (s = 0; s < g_streams; s++) {
 					total_dq += g_dequeued[s];
-					total_sent += g_sent[s];
+					total_sent += __atomic_load_n(&g_sent[s], __ATOMIC_RELAXED);
 				}
 				double sec = (double)(tsc_now - g_last_tsc) / (double)tsc_hz;
 				uint64_t d_dq = total_dq - g_last_dequeued_total;
 				uint64_t d_sent = total_sent - g_last_sent_total;
+				uint64_t interval_tsc = tsc_now - g_last_tsc;
+				uint64_t tsc_send = __atomic_exchange_n(&g_tsc_in_send_interval, 0, __ATOMIC_RELAXED);
+				double pct_send = (interval_tsc > 0) ? (100.0 * (double)tsc_send / (double)interval_tsc) : 0.0;
 				g_last_tsc = tsc_now;
 				g_last_dequeued_total = total_dq;
 				g_last_sent_total = total_sent;
-				printf("DIFI RX: inbound %" PRIu64 "/s, outbound %" PRIu64 "/s (dest %s:%u)\n",
+				printf("DIFI RX: inbound %" PRIu64 "/s, outbound %" PRIu64 "/s (dest %s:%u) time_in_send %.1f%%\n",
 					(uint64_t)((double)d_dq / sec), (uint64_t)((double)d_sent / sec),
-					g_dest_addr, (unsigned)g_dest_port);
+					g_dest_addr, (unsigned)g_dest_port, pct_send);
 			}
 		}
 	}
+
+	if (use_dedicated_send && send_lcore_id < RTE_MAX_LCORE)
+		rte_eal_wait_lcore(send_lcore_id);
 
 	/* Optional: send context packets with EOB/EOS before exit */
 	if (g_udp_sock >= 0 && (g_eob_on_exit || g_eos_on_exit))
@@ -596,6 +775,12 @@ int main(int argc, char **argv)
 
 	if (g_udp_sock >= 0)
 		close(g_udp_sock);
+	if (use_dedicated_send && g_send_pool) {
+		for (unsigned int i = 0; i < SEND_POOL_SIZE; i++)
+			free(g_send_pool[i].buf);
+		free(g_send_pool);
+		g_send_pool = NULL;
+	}
 	if (g_use_shm) {
 		for (s = 0; s < g_streams; s++)
 			free(g_shm_difi_bufs[s]);
