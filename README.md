@@ -1,4 +1,4 @@
-# DIFI API
+# DPDK Integration API
 
 A test and reference implementation for streaming **IQ data** over **DIFI** (Digital IF Interoperability) using a **DPDK-based pipeline**. Producer processes enqueue IQ chunks into shared rings; a primary process drains the rings, wraps the data in DIFI packets, and sends them over UDP.
 
