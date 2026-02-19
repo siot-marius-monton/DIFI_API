@@ -12,9 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -82,7 +79,6 @@ static uint16_t g_streams       = 16;
 static uint32_t g_chunk_ms      = IQ_DEFAULT_CHUNK_MS;
 static uint32_t g_samples_per_chunk = 0;  /* if > 0, use directly (overrides chunk_ms) */
 static char     g_file_prefix[32] = "iqdemo";
-static int      g_use_shm       = 0;
 static char     g_dest_addr[64] = "127.0.0.1";
 static uint16_t g_dest_port     = 50000;
 static int      g_eob_on_exit   = 0;  /* send context packet with EOB on exit */
@@ -90,9 +86,6 @@ static int      g_eos_on_exit   = 0;  /* send context packet with EOS on exit */
 static int      g_no_send       = 0;  /* if set, drain rings but do not send UDP (for bottleneck testing) */
 
 static struct rte_ring *g_rings[IQ_MAX_STREAMS];
-static struct rte_ring *g_free_ring;
-static void    *g_shm_base;
-static int      g_shm_fd = -1;
 
 static int g_udp_sock = -1;
 static struct sockaddr_in g_dest_saddr;
@@ -106,16 +99,15 @@ static uint32_t g_total_chunk_bytes;
 static uint8_t  g_class_id_blob[12];
 static uint32_t g_word0_template;
 
-/* Pre-allocated send buffers for --use-shm (one per stream; header pre-filled, only seq+ts+payload updated) */
-static uint8_t *g_shm_difi_bufs[IQ_MAX_STREAMS];
-
-/* Pre-allocated DIFI header buffers for mbuf path (one per stream); used with sendmsg iovec to avoid touching mbuf payload */
+/* Pre-allocated DIFI header buffers (one per stream); used with sendmsg iovec to avoid touching mbuf payload */
 static uint8_t *g_mbuf_header_bufs[IQ_MAX_STREAMS];
 
 /* Per-stream stats: inbound = dequeued from rings, outbound = sent over UDP */
 static uint64_t g_dequeued[IQ_MAX_STREAMS];  /* inbound: chunks received from producer */
 static uint64_t g_sent[IQ_MAX_STREAMS];     /* outbound: DIFI packets sent */
 static uint64_t g_seq_errors[IQ_MAX_STREAMS];
+static uint64_t g_inbound_errors;   /* dequeued but not sent (validation fail or no pool buffer) */
+static uint64_t g_outbound_errors;  /* sendmmsg/sendto failure or partial send */
 static uint64_t g_last_tsc;
 static uint64_t g_last_dequeued_total;
 static uint64_t g_last_sent_total;
@@ -134,8 +126,6 @@ static int parse_app_args(int argc, char **argv)
 			g_samples_per_chunk = (uint32_t)atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--file-prefix") == 0 && i + 1 < argc) {
 			snprintf(g_file_prefix, sizeof(g_file_prefix), "%s", argv[++i]);
-		} else if (strcmp(argv[i], "--use-shm") == 0) {
-			g_use_shm = 1;
 		} else if (strcmp(argv[i], "--dest") == 0 && i + 1 < argc) {
 			const char *dest = argv[++i];
 			const char *colon = strrchr(dest, ':');
@@ -372,6 +362,10 @@ static int send_worker(void *arg)
 		__atomic_fetch_add(&g_tsc_in_send_interval, (rte_rdtsc() - tsc_before), __ATOMIC_RELAXED);
 		for (int i = 0; i < sent; i++)
 			__atomic_fetch_add(&g_sent[batch_items[i]->stream_id], 1, __ATOMIC_RELAXED);
+		if (sent >= 0 && sent < (int)n)
+			__atomic_fetch_add(&g_outbound_errors, (unsigned int)n - (unsigned int)sent, __ATOMIC_RELAXED);
+		else if (sent < 0)
+			__atomic_fetch_add(&g_outbound_errors, n, __ATOMIC_RELAXED);
 		for (unsigned int i = 0; i < n; i++) {
 			while (rte_ring_sp_enqueue(g_pool_ring, batch_items[i]) != 0)
 				;
@@ -428,11 +422,6 @@ int main(int argc, char **argv)
 			"Chunk size %u > mbuf data size %u; reduce --chunk-ms or --samples-per-chunk\n",
 			(unsigned)g_total_chunk_bytes, (unsigned)MBUF_DATA_SIZE);
 	}
-	if (g_use_shm && g_total_chunk_bytes > IQ_SHM_SLOT_SIZE) {
-		rte_exit(EXIT_FAILURE,
-			"Chunk size %u > shm slot size %u\n",
-			(unsigned)g_total_chunk_bytes, (unsigned)IQ_SHM_SLOT_SIZE);
-	}
 
 	if (!g_no_send) {
 		g_udp_sock = open_udp_socket();
@@ -442,22 +431,20 @@ int main(int argc, char **argv)
 		g_udp_sock = -1;
 	}
 
-	if (!g_use_shm) {
-		iq_mempool_name(g_file_prefix, name, sizeof(name));
-		if (!rte_pktmbuf_pool_create(name, MBUF_POOL_SIZE, 0, 0,
-				MBUF_DATA_SIZE, rte_socket_id()))
-			rte_exit(EXIT_FAILURE, "mempool create failed: %s\n", rte_strerror(rte_errno));
-		/* Pre-allocate and pre-fill one DIFI header buffer per stream for zero-copy sendmsg (no write into mbuf) */
-		for (s = 0; s < g_streams; s++) {
-			g_mbuf_header_bufs[s] = malloc(DIFI_HEADER_BYTES);
-			if (!g_mbuf_header_bufs[s])
-				rte_exit(EXIT_FAILURE, "malloc mbuf_header_buf stream %u failed\n", (unsigned)s);
-			uint8_t *b = g_mbuf_header_bufs[s];
-			store_be32(b + 0, g_word0_template);
-			store_be32(b + 4, (uint32_t)s);
-			memcpy(b + 8, g_class_id_blob, 12);
-			memset(b + 20, 0, 12);
-		}
+	iq_mempool_name(g_file_prefix, name, sizeof(name));
+	if (!rte_pktmbuf_pool_create(name, MBUF_POOL_SIZE, 0, 0,
+			MBUF_DATA_SIZE, rte_socket_id()))
+		rte_exit(EXIT_FAILURE, "mempool create failed: %s\n", rte_strerror(rte_errno));
+	/* Pre-allocate and pre-fill one DIFI header buffer per stream for zero-copy sendmsg (no write into mbuf) */
+	for (s = 0; s < g_streams; s++) {
+		g_mbuf_header_bufs[s] = malloc(DIFI_HEADER_BYTES);
+		if (!g_mbuf_header_bufs[s])
+			rte_exit(EXIT_FAILURE, "malloc mbuf_header_buf stream %u failed\n", (unsigned)s);
+		uint8_t *b = g_mbuf_header_bufs[s];
+		store_be32(b + 0, g_word0_template);
+		store_be32(b + 4, (uint32_t)s);
+		memcpy(b + 8, g_class_id_blob, 12);
+		memset(b + 20, 0, 12);
 	}
 
 	for (s = 0; s < g_streams; s++) {
@@ -466,40 +453,6 @@ int main(int argc, char **argv)
 			RING_F_SP_ENQ | RING_F_SC_DEQ);
 		if (!g_rings[s])
 			rte_exit(EXIT_FAILURE, "ring create %s failed: %s\n", name, rte_strerror(rte_errno));
-	}
-
-	if (g_use_shm) {
-		size_t shm_size = (size_t)IQ_SHM_N_SLOTS * (size_t)IQ_SHM_SLOT_SIZE;
-		iq_shm_name(g_file_prefix, name, sizeof(name));
-		g_shm_fd = shm_open(name, O_CREAT | O_RDWR, 0666);
-		if (g_shm_fd < 0)
-			rte_exit(EXIT_FAILURE, "shm_open %s failed\n", name);
-		if (ftruncate(g_shm_fd, (off_t)shm_size) != 0)
-			rte_exit(EXIT_FAILURE, "ftruncate shm failed\n");
-		g_shm_base = mmap((void *)IQ_SHM_BASE_VA, shm_size,
-			PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, g_shm_fd, 0);
-		if (g_shm_base == MAP_FAILED)
-			rte_exit(EXIT_FAILURE, "mmap shm at %p failed (try setarch for same VA)\n", (void *)IQ_SHM_BASE_VA);
-		iq_free_ring_name(g_file_prefix, name, sizeof(name));
-		g_free_ring = rte_ring_create(name, (unsigned)IQ_SHM_N_SLOTS, rte_socket_id(),
-			RING_F_MP_RTS_ENQ | RING_F_MC_RTS_DEQ);
-		if (!g_free_ring)
-			rte_exit(EXIT_FAILURE, "free ring create failed: %s\n", rte_strerror(rte_errno));
-		for (uint32_t i = 0; i < IQ_SHM_N_SLOTS; i++) {
-			while (rte_ring_sp_enqueue(g_free_ring, (void *)(uintptr_t)i) != 0)
-				;
-		}
-		/* Pre-allocate and pre-fill one DIFI send buffer per stream (header constant parts only) */
-		for (s = 0; s < g_streams; s++) {
-			g_shm_difi_bufs[s] = malloc(DIFI_HEADER_BYTES + g_payload_bytes);
-			if (!g_shm_difi_bufs[s])
-				rte_exit(EXIT_FAILURE, "malloc shm_difi_buf stream %u failed\n", (unsigned)s);
-			uint8_t *b = g_shm_difi_bufs[s];
-			store_be32(b + 0, g_word0_template);
-			store_be32(b + 4, (uint32_t)s);
-			memcpy(b + 8, g_class_id_blob, 12);
-			memset(b + 20, 0, 12);
-		}
 	}
 
 	g_packet_len = DIFI_HEADER_BYTES + g_payload_bytes;
@@ -535,14 +488,15 @@ int main(int argc, char **argv)
 	memset(g_dequeued, 0, sizeof(g_dequeued));
 	memset(g_sent, 0, sizeof(g_sent));
 	memset(g_seq_errors, 0, sizeof(g_seq_errors));
+	g_inbound_errors = 0;
+	g_outbound_errors = 0;
 	g_last_tsc = rte_rdtsc();
 	g_start_tsc = g_last_tsc;
 	g_last_dequeued_total = 0;
 	g_last_sent_total = 0;
 
-	printf("difi_dpdk_receiver (primary): streams=%u samples_per_chunk=%u dest=%s:%u%s%s%s%s%s\n",
+	printf("difi_dpdk_receiver (primary): streams=%u samples_per_chunk=%u dest=%s:%u%s%s%s%s\n",
 		(unsigned)g_streams, (unsigned)samples_per_chunk, g_dest_addr, (unsigned)g_dest_port,
-		g_use_shm ? " (shm)" : "",
 		g_eob_on_exit ? " eob-on-exit" : "",
 		g_eos_on_exit ? " eos-on-exit" : "",
 		g_no_send ? " NO-SEND (drain only)" : "",
@@ -579,62 +533,20 @@ int main(int argc, char **argv)
 
 			g_dequeued[s]++;
 
-			if (g_use_shm) {
-				uint32_t slot_id = (uint32_t)(uintptr_t)obj;
-				if (slot_id >= IQ_SHM_N_SLOTS) continue;
-				struct iq_chunk_hdr *hdr = (struct iq_chunk_hdr *)((char *)g_shm_base + slot_id * IQ_SHM_SLOT_SIZE);
-				uint8_t *payload_ptr = (uint8_t *)(hdr + 1);
-
-				if (hdr->magic != IQ_CHUNK_MAGIC || hdr->version != IQ_CHUNK_VERSION)
-					continue;
-				if (hdr->stream_id >= g_streams || hdr->payload_len != g_payload_bytes) {
-					rte_ring_sp_enqueue(g_free_ring, obj);
-					continue;
-				}
-
-				uint8_t *difi_buf = g_shm_difi_bufs[s];
-				uint32_t ts_sec;
-				uint64_t ts_ps;
-				timestamp_ns_to_difi(hdr->timestamp_ns, &ts_sec, &ts_ps);
-				write_difi_header_variable(difi_buf, (uint32_t)hdr->stream_id,
-					(uint8_t)(hdr->seq & 0xF), ts_sec, ts_ps);
-				memcpy(difi_buf + DIFI_HEADER_BYTES, payload_ptr, g_payload_bytes);
-
-				if (use_dedicated_send) {
-					struct send_item *item;
-					if (rte_ring_sc_dequeue(g_pool_ring, (void **)&item) == 0) {
-						memcpy(item->buf, difi_buf, (size_t)g_packet_len);
-						item->stream_id = s;
-						while (rte_ring_sp_enqueue(g_send_ring, item) != 0)
-							;
-					}
-					rte_ring_sp_enqueue(g_free_ring, obj);
-				} else {
-					batch_stream_ids[batch_count] = s;
-					batch_objs[batch_count] = obj;
-					memset(&msgvec[batch_count].msg_hdr, 0, sizeof(struct msghdr));
-					msgvec[batch_count].msg_hdr.msg_name = (void *)&g_dest_saddr;
-					msgvec[batch_count].msg_hdr.msg_namelen = sizeof(g_dest_saddr);
-					iovs[batch_count][0].iov_base = difi_buf;
-					iovs[batch_count][0].iov_len  = (size_t)g_packet_len;
-					msgvec[batch_count].msg_hdr.msg_iov = &iovs[batch_count][0];
-					msgvec[batch_count].msg_hdr.msg_iovlen = 1;
-					batch_count++;
-				}
-			} else {
+			{
 				struct rte_mbuf *chunk_mbuf = (struct rte_mbuf *)obj;
 				struct iq_chunk_hdr *hdr = rte_pktmbuf_mtod(chunk_mbuf, struct iq_chunk_hdr *);
 
 				if (hdr->magic != IQ_CHUNK_MAGIC || hdr->version != IQ_CHUNK_VERSION) {
 					rte_pktmbuf_free(chunk_mbuf);
-					continue;
+					g_inbound_errors++; continue;
 				}
 				if (hdr->stream_id >= g_streams || hdr->payload_len != g_payload_bytes) {
 					rte_pktmbuf_free(chunk_mbuf);
-					continue;
+					g_inbound_errors++; continue;
 				}
 
-				uint8_t *payload_ptr = rte_pktmbuf_mtod(chunk_mbuf, uint8_t *) + DIFI_HEADER_BYTES;
+				uint8_t *payload_ptr = rte_pktmbuf_mtod(chunk_mbuf, uint8_t *) + sizeof(struct iq_chunk_hdr);
 				uint32_t ts_sec;
 				uint64_t ts_ps;
 				timestamp_ns_to_difi(hdr->timestamp_ns, &ts_sec, &ts_ps);
@@ -649,7 +561,8 @@ int main(int argc, char **argv)
 						item->stream_id = s;
 						while (rte_ring_sp_enqueue(g_send_ring, item) != 0)
 							;
-					}
+					} else
+						g_inbound_errors++;
 					rte_pktmbuf_free(chunk_mbuf);
 				} else {
 					batch_stream_ids[batch_count] = s;
@@ -677,13 +590,13 @@ int main(int argc, char **argv)
 					for (unsigned int i = 0; i < (unsigned int)sent && i < batch_count; i++)
 						g_sent[batch_stream_ids[i]]++;
 				}
+				if (sent >= 0 && (unsigned int)sent < batch_count)
+					g_outbound_errors += (unsigned int)batch_count - (unsigned int)sent;
+				else if (sent < 0)
+					g_outbound_errors += (unsigned int)batch_count;
 			}
-			for (unsigned int i = 0; i < batch_count; i++) {
-				if (g_use_shm)
-					rte_ring_sp_enqueue(g_free_ring, batch_objs[i]);
-				else
-					rte_pktmbuf_free((struct rte_mbuf *)batch_objs[i]);
-			}
+			for (unsigned int i = 0; i < batch_count; i++)
+				rte_pktmbuf_free((struct rte_mbuf *)batch_objs[i]);
 		}
 
 		/* Stats every 1 second */
@@ -701,12 +614,15 @@ int main(int argc, char **argv)
 				uint64_t interval_tsc = tsc_now - g_last_tsc;
 				uint64_t tsc_send = __atomic_exchange_n(&g_tsc_in_send_interval, 0, __ATOMIC_RELAXED);
 				double pct_send = (interval_tsc > 0) ? (100.0 * (double)tsc_send / (double)interval_tsc) : 0.0;
+				uint64_t out_err = __atomic_load_n(&g_outbound_errors, __ATOMIC_RELAXED);
+				double inbound_err_pct = (total_dq > 0) ? (100.0 * (double)g_inbound_errors / (double)total_dq) : 0.0;
+				double outbound_err_pct = (total_sent + out_err > 0) ? (100.0 * (double)out_err / (double)(total_sent + out_err)) : 0.0;
 				g_last_tsc = tsc_now;
 				g_last_dequeued_total = total_dq;
 				g_last_sent_total = total_sent;
-				printf("DIFI RX: inbound %" PRIu64 "/s, outbound %" PRIu64 "/s (dest %s:%u) time_in_send %.1f%%\n",
+				printf("DIFI RX: inbound %" PRIu64 "/s, outbound %" PRIu64 "/s (dest %s:%u) time_in_send %.1f%% in_err %.2f%% out_err %.2f%%\n",
 					(uint64_t)((double)d_dq / sec), (uint64_t)((double)d_sent / sec),
-					g_dest_addr, (unsigned)g_dest_port, pct_send);
+					g_dest_addr, (unsigned)g_dest_port, pct_send, inbound_err_pct, outbound_err_pct);
 			}
 		}
 	}
@@ -723,7 +639,7 @@ int main(int argc, char **argv)
 		uint64_t total_dequeued = 0, total_sent = 0;
 		for (s = 0; s < g_streams; s++) {
 			total_dequeued += g_dequeued[s];
-			total_sent += g_sent[s];
+			total_sent += __atomic_load_n(&g_sent[s], __ATOMIC_RELAXED);
 		}
 		uint64_t end_tsc = rte_rdtsc();
 		uint64_t duration_tsc = (end_tsc > g_start_tsc) ? (end_tsc - g_start_tsc) : 0;
@@ -749,14 +665,20 @@ int main(int argc, char **argv)
 		printf("\n=== difi_dpdk_receiver final ===\n");
 		printf("Duration:         %.3f s\n\n", duration_sec);
 
+		uint64_t total_out_err = __atomic_load_n(&g_outbound_errors, __ATOMIC_RELAXED);
+		double in_err_pct = (total_dequeued > 0) ? (100.0 * (double)g_inbound_errors / (double)total_dequeued) : 0.0;
+		double out_err_pct = (total_sent + total_out_err > 0) ? (100.0 * (double)total_out_err / (double)(total_sent + total_out_err)) : 0.0;
+
 		printf("--- Inbound (from producer, ring dequeue) ---\n");
 		printf("Chunks:           %" PRIu64 "\n", total_dequeued);
+		printf("Errors:          %" PRIu64 " (%.2f%%)\n", g_inbound_errors, in_err_pct);
 		printf("Bytes:            %" PRIu64 " (wire), %" PRIu64 " (payload)\n", inbound_bytes, inbound_payload);
 		printf("Throughput:       %.1f chunks/s, %.2f Mbps (wire), %.2f Mbps (payload)\n\n",
 			inbound_pps, inbound_mbps_wire, inbound_mbps_payload);
 
 		printf("--- Outbound (to network, UDP send) ---\n");
 		printf("Packets sent:     %" PRIu64 "\n", total_sent);
+		printf("Errors:          %" PRIu64 " (%.2f%%)\n", total_out_err, out_err_pct);
 		printf("Bytes sent:      %" PRIu64 " (wire), %" PRIu64 " (payload)\n", outbound_bytes, outbound_payload);
 		printf("Throughput:       %.1f packets/s, %.2f Mbps (wire), %.2f Mbps (payload)\n",
 			outbound_pps, outbound_mbps_wire, outbound_mbps_payload);
@@ -769,7 +691,7 @@ int main(int argc, char **argv)
 				printf("%" PRIu64 "%s", g_dequeued[s], (s + 1 < g_streams) ? ", " : "\n");
 			printf("Per-stream outbound (sent):   ");
 			for (s = 0; s < g_streams; s++)
-				printf("%" PRIu64 "%s", g_sent[s], (s + 1 < g_streams) ? ", " : "\n");
+				printf("%" PRIu64 "%s", __atomic_load_n(&g_sent[s], __ATOMIC_RELAXED), (s + 1 < g_streams) ? ", " : "\n");
 		}
 	}
 
@@ -781,13 +703,8 @@ int main(int argc, char **argv)
 		free(g_send_pool);
 		g_send_pool = NULL;
 	}
-	if (g_use_shm) {
-		for (s = 0; s < g_streams; s++)
-			free(g_shm_difi_bufs[s]);
-	} else {
-		for (s = 0; s < g_streams; s++)
-			free(g_mbuf_header_bufs[s]);
-	}
+	for (s = 0; s < g_streams; s++)
+		free(g_mbuf_header_bufs[s]);
 	rte_eal_cleanup();
 	return 0;
 }

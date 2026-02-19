@@ -52,26 +52,6 @@ static inline void iq_ring_name(const char *prefix, uint16_t stream_id, char *ou
 }
 
 /* -------------------------------------------------------------------------
- * Optional shared-memory (shm) path for NXP/ARM where DPDK mempool mapping
- * fails in secondary. Chunk data lives in POSIX shm; rings pass slot indices.
- * ------------------------------------------------------------------------- */
-#define IQ_SHM_SLOT_SIZE  65536u   /* max chunk size per slot; must be >= total_chunk_bytes */
-#define IQ_SHM_N_SLOTS    512u
-#define IQ_SHM_BASE_VA    ((uintptr_t)0x3000000000ULL)
-
-/* POSIX shm name (leading slash; keep short for NAME_MAX). */
-static inline void iq_shm_name(const char *prefix, char *out, unsigned out_len)
-{
-	snprintf(out, (size_t)out_len, "/%s_chunks", prefix);
-}
-
-/* Ring name for free-slot pool (used only when --use-shm). */
-static inline void iq_free_ring_name(const char *prefix, char *out, unsigned out_len)
-{
-	snprintf(out, (size_t)out_len, "%s_free", prefix);
-}
-
-/* -------------------------------------------------------------------------
  * Chunk size math (must match between A and B for same chunk_ms and sample_rate_hz):
  *   samples_per_chunk = round(sample_rate_hz * chunk_ms / 1000.0)
  *   payload_bytes     = samples_per_chunk * 2   (I and Q bytes)

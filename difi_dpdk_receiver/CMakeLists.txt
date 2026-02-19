@@ -19,5 +19,5 @@ target_include_directories(difi_dpdk_receiver PRIVATE
   ${DPDK_INCLUDE_DIRS}
   ${DIFI_C_LIB_DIR}/include
 )
-target_compile_options(difi_dpdk_receiver PRIVATE ${DPDK_CFLAGS} -O2 -g)
+target_compile_options(difi_dpdk_receiver PRIVATE ${DPDK_CFLAGS} -O3)
 target_link_libraries(difi_dpdk_receiver PRIVATE difi ${DPDK_LDFLAGS} rt)

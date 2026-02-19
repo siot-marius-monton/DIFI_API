@@ -19,7 +19,7 @@ esac
 EAL_MEM="-m 512"
 EAL_OPTS="--proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem $EAL_MEM -l 0"
 EAL_OPTS_SEC="--proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem $EAL_MEM -l 1"
-APP_OPTS="--streams 16 --chunk-ms 2 --use-shm"
+APP_OPTS="--streams 16 --chunk-ms 2"
 DEST="${DIFI_DEST:-127.0.0.1:50000}"
 SENDER_APP_OPTS="$APP_OPTS"
 [ -n "${DIFI_MAX_RATE}" ] && [ "$DIFI_MAX_RATE" != "0" ] && SENDER_APP_OPTS="$SENDER_APP_OPTS --no-rate-limit"

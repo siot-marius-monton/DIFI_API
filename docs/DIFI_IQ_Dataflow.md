@@ -30,7 +30,11 @@ flowchart LR
       Rings[rings 0..N]
     end
     subgraph difi_sw [DIFI Sender SW]
-      Receiver[difi_dpdk_receiver]
+      Drain[drain: dequeue rings]
+      SendRing[send_ring]
+      SendWorker[send worker]
+      Drain --> SendRing
+      SendRing --> SendWorker
     end
   end
 
@@ -44,13 +48,14 @@ flowchart LR
 
   Sender -->|"enqueue mbuf/slot"| Mempool
   Sender -->|"enqueue ptr/slot_id"| Rings
-  Mempool --> Receiver
-  Rings -->|"dequeue"| Receiver
-  Receiver -->|"sendmsg / sendto"| UDP
+  Mempool --> Drain
+  Rings -->|"dequeue"| Drain
+  Drain --> SendRing
+  SendWorker -->|"sendmmsg / sendto"| UDP
   UDP -->|"recv"| DifiRecv
 ```
 
-- **Producer host**: runs `sender_C_example` (secondary) and `difi_dpdk_receiver` (primary). They share mempool and rings (or shm + rings).
+- **Producer host**: runs `sender_C_example` (secondary) and `difi_dpdk_receiver` (primary). They share mempool and rings. The receiver may use one lcore to drain per-stream rings and a second lcore as a dedicated send worker (send_ring → sendmmsg batches → pool_ring).
 - **Consumer host**: runs `difi_recv`; can be the same machine (localhost) or another host.
 
 ---
@@ -61,34 +66,31 @@ flowchart LR
 flowchart TB
   subgraph producer [Producer: sender_C_example]
     Gen[Generate or load IQ]
-    FillMbuf[Fill mbuf or shm slot]
+    FillMbuf[Fill mbuf]
     Enqueue[Enqueue to ring per stream]
     Gen --> FillMbuf
     FillMbuf --> Enqueue
   end
 
   subgraph buffers [Shared Buffers]
-    direction TB
-    subgraph mbuf_path [Mbuf path]
-      Mbuf["mbuf: [iq_chunk_hdr 32B][IQ payload]"]
-    end
-    subgraph shm_path [Shm path]
-      ShmSlot["shm slot: [iq_chunk_hdr 32B][IQ payload]"]
-      RingSlot["ring: slot_id"]
-    end
+    Mbuf["mbuf: [iq_chunk_hdr 32B][IQ payload]"]
   end
 
   subgraph difi_sender [DIFI Sender: difi_dpdk_receiver]
     Dequeue[Dequeue from ring]
     Validate[Validate chunk header]
+    InboundErr[Inbound error if bad magic/version/stream_id/len or pool empty]
     Header[Pre-filled DIFI header buffer]
     PayloadPtr[Payload pointer]
-    SendMsg[sendmsg: iov header + payload]
+    ToSend[Enqueue to send_ring or send directly]
+    SendMsg[send worker: sendmmsg batches; outbound error on send failure]
     Dequeue --> Validate
+    Validate --> InboundErr
     Validate --> Header
     Validate --> PayloadPtr
-    Header --> SendMsg
-    PayloadPtr --> SendMsg
+    Header --> ToSend
+    PayloadPtr --> ToSend
+    ToSend --> SendMsg
   end
 
   subgraph wire [On the wire]
@@ -104,11 +106,7 @@ flowchart TB
   end
 
   Enqueue --> Mbuf
-  Enqueue --> ShmSlot
-  Enqueue --> RingSlot
   Mbuf --> Dequeue
-  ShmSlot --> Dequeue
-  RingSlot --> Dequeue
   SendMsg --> DIFI
   DIFI --> Recv
 ```
@@ -134,12 +132,25 @@ flowchart TB
 | Component | Process type | Role |
 |-----------|--------------|------|
 | **sender_C_example** | DPDK secondary | Allocates mbufs (or shm slots), fills chunk header + deterministic IQ, enqueues to ring per stream. Rate-limited by chunk_ms unless `--no-rate-limit`. |
-| **difi_dpdk_receiver** | DPDK primary | Creates mempool and rings (or shm + rings). Sends one standard context packet (PTYPE 0x4) per stream at startup (8-bit IQ) so difi_recv has payload format before first data. Dequeues per stream, validates chunk, uses pre-filled DIFI header + payload pointer, sends one UDP packet per chunk via sendmsg (zero-copy for payload). |
+| **difi_dpdk_receiver** | DPDK primary | Creates mempool and rings (or shm + rings). Sends one standard context packet (PTYPE 0x4) per stream at startup (8-bit IQ) so difi_recv has payload format before first data. Dequeues per stream, validates chunk (magic, version, stream_id, payload_len); invalid or dropped chunks count as **inbound errors**. Valid chunks are enqueued to an internal send_ring (when using dedicated send core) or sent directly; a **send worker** on a second lcore dequeues from send_ring, sends batches via **sendmmsg**, and returns buffers to a pool_ring. Send failures count as **outbound errors**. Periodic stats report **time_in_send %**, **in_err %**, **out_err %**; final summary shows **Errors: N (X.XX%)** for inbound and outbound. Optional **--no-send** drains only (no UDP). **--samples-per-chunk N** (e.g. 256) fixes chunk size by samples for low latency. |
 | **difi_recv** | Standard process | Binds to UDP port, receives DIFI packets, decodes context/data, reports stream ID/seq/samples, optionally writes I/Q to file. |
 
 ---
 
-## 6. Deployment Variants
+## 6. Stats and error reporting
+
+The receiver reports:
+
+- **Periodic (every 1 s):** `DIFI RX: inbound X/s, outbound Y/s (dest host:port) time_in_send Z% in_err a.bc% out_err d.ef%`
+  - **time_in_send:** Fraction of time in the send path (TSC-based).
+  - **in_err:** Cumulative **inbound** error share (chunks dequeued but not sent: validation failure or, with dedicated send, pool_ring empty).
+  - **out_err:** Cumulative **outbound** error share (send failures, e.g. sendmmsg returned &lt; batch or &lt; 0).
+
+- **On exit:** Final summary with **Inbound** and **Outbound** blocks. Each includes chunk/packet counts, bytes, throughput, per-stream breakdown, and **Errors: N (X.XX%)**. Counts use atomic reads so they stay correct when the dedicated send worker updates outbound state.
+
+---
+
+## 7. Deployment Variants
 
 **Same host (loopback)**  
 - Producer + DIFI sender on one machine.  
@@ -155,7 +166,7 @@ flowchart TB
 
 ---
 
-## 7. Sequence (Time Order)
+## 8. Sequence (Time Order)
 
 ```mermaid
 sequenceDiagram
@@ -184,7 +195,7 @@ sequenceDiagram
 
 ---
 
-## 8. File and Component Locations
+## 9. File and Component Locations
 
 | Item | Path / binary |
 |------|-------------------------------|
@@ -198,20 +209,20 @@ sequenceDiagram
 
 The **primary must be running before** the secondary. The secondary blocks in `rte_eal_init()` until it can attach to the primary's shared memory; if you start only the secondary, it will hang after "EAL: Detected shared linkage of DPDK".
 
-**Terminal 1 – start primary first (creates mempool and rings):**
+**Terminal 1 – start primary first (creates mempool and rings).** Use `-l 0` for one core or `-l 0,1` for dedicated send core:
 
 ```bash
 sudo setarch $(uname -m) -R ./difi_dpdk_receiver/build/difi_dpdk_receiver \
-  --proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
-  --streams 16 --chunk-ms 2 --use-shm --dest 127.0.0.1:50000
+  --proc-type=primary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -l 0,1 -- \
+  --streams 16 --chunk-ms 2 --dest 127.0.0.1:50000
 ```
 
-**Terminal 2 – after primary is up, start secondary:**
+**Terminal 2 – after primary is up, start secondary (e.g. pin to core 1 with `-l 1`):**
 
 ```bash
 sudo setarch $(uname -m) -R ./sender_C_example/build/sender_C_example \
-  --proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -- \
-  --streams 16 --chunk-ms 2 --use-shm
+  --proc-type=secondary --file-prefix=iqdemo --base-virtaddr=0x2000000000 --legacy-mem -m 512 -l 1 -- \
+  --streams 16 --chunk-ms 2
 ```
 
 Use the same EAL options (e.g. `-m 512`, `--file-prefix=iqdemo`) on both. The **`-R`** flag (disable ASLR) is required so the secondary can map the primary's memory; without it the secondary may segfault or hang. The `--dest` option is only for the primary (DIFI sender); the sender app does not take `--dest`.
@@ -226,7 +237,7 @@ If you stop the primary with Ctrl+C or kill without a clean shutdown, DPDK leave
 sudo rm -rf /var/run/dpdk/iqdemo
 ```
 
-Then start the **primary** (difi_dpdk_receiver) first, then the secondary (sender_C_example). If you use hugepage-backed resources and see persistent issues, you may need to clear hugepages (e.g. `sudo rm -f /dev/hugepages/*` or reboot); for `--use-shm` the socket cleanup is usually enough.
+Then start the **primary** (difi_dpdk_receiver) first, then the secondary (sender_C_example). If you use hugepage-backed resources and see persistent issues, you may need to clear hugepages (e.g. `sudo rm -f /dev/hugepages/*` or reboot); otherwise socket cleanup is usually enough.
 
 ### Throughput (approaching 2 Gbps)
 

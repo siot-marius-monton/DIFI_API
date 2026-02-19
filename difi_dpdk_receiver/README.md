@@ -46,7 +46,7 @@ sudo setarch $(uname -m) -R ./sender_C_example/build/sender_C_example \
 
 The `-l` value can differ between primary and secondary (each process has its own lcores). Use any free cores, e.g. `-l 2` and `-l 3` instead of 0 and 1.
 
-**If sender_C_example segfaults:** The primary must be started **with setarch first** so its memory is at a fixed address. Use the **exact same** EAL options on both (including `-m 512`). Or use **`--use-shm`** for both to avoid shared mempool mapping: add `--use-shm` after `--chunk-ms 2` on both commands; then setarch is still recommended but the segfault from ASLR is avoided.
+**If sender_C_example segfaults:** The primary must be started **with setarch first** so its memory is at a fixed address. Use the **exact same** EAL options on both (including `-m 512`).
 
 ### Application options (after `--`)
 
@@ -57,7 +57,6 @@ The `-l` value can differ between primary and secondary (each process has its ow
 | `--samples-per-chunk N` | IQ samples per chunk (overrides chunk-ms; must match sender; use for low latency) | off |
 | `--file-prefix P` | Prefix for ring/mempool names (match sender) | iqdemo |
 | `--dest host:port` | UDP destination for DIFI packets | 127.0.0.1:50000 |
-| `--use-shm` | Use POSIX shm for chunk data (NXP/ARM compatibility) | off |
 | `--eob-on-exit` | On exit, send one DIFI context packet per stream with End-of-Burst (SEI) set | off |
 | `--eos-on-exit` | On exit, send one DIFI context packet per stream with End-of-Stream (SEI) set | off |
 
@@ -67,7 +66,7 @@ On exit, the application prints performance metrics separately for **inbound** (
 
 EAL options (before `--`) that must match the sender: `--proc-type=primary` / `secondary`, `--file-prefix`, `--base-virtaddr`, `--legacy-mem`, `-m`. The **`-l` (lcore list)** can and should differ: use **`-l 0`** for the receiver and **`-l 1`** for the sender so they run on separate cores (zero drops with 16 streams, 1 worker). For high packet rate (e.g. 8 streams, 512 samples/chunk), use **`-l 0,1`** for the receiver to enable a **dedicated send core** (drain on lcore 0, send on lcore 1); the startup line will show **dedicated-send**.
 
-**Low latency:** Use `--samples-per-chunk N` on both primary and sender to fix chunk size by samples instead of time. Example: `--samples-per-chunk 256` gives chunk duration 256 / 7.68e6 ≈ **33.3 µs** (vs 2 ms at default chunk-ms). Primary: `--samples-per-chunk 256 --dest ...`; sender: `--samples-per-chunk 256` (and optionally `--use-shm`). Packet rate becomes 7.68e6/256 ≈ 30,000 packets/s per stream.
+**Low latency:** Use `--samples-per-chunk N` on both primary and sender to fix chunk size by samples instead of time. Example: `--samples-per-chunk 256` gives chunk duration 256 / 7.68e6 ≈ **33.3 µs** (vs 2 ms at default chunk-ms). Primary: `--samples-per-chunk 256 --dest ...`; sender: `--samples-per-chunk 256`. Packet rate becomes 7.68e6/256 ≈ 30,000 packets/s per stream.
 
 ## Optional: run script
 
@@ -123,7 +122,7 @@ sudo setarch $(uname -m) -R ./sender_C_example/build/sender_C_example \
   --streams 16 --chunk-ms 2
 ```
 
-If the sender segfaults, see **“If sender_C_example segfaults”** in the Run section above, or use the script: `sudo ./difi_dpdk_receiver/run_difi_receiver.sh` (it uses `--use-shm` and setarch for both).
+If the sender segfaults, see **“If sender_C_example segfaults”** in the Run section above, or use the script: `sudo ./difi_dpdk_receiver/run_difi_receiver.sh` (uses setarch for both).
 
 **What you should see**
 
@@ -139,4 +138,4 @@ If the sender segfaults, see **“If sender_C_example segfaults”** in the Run 
 
 ## Zero-copy
 
-With mbufs (default): the first 32 bytes of each dequeued mbuf (the IQ chunk header) are overwritten with the DIFI data header; the IQ payload is not copied. The same buffer is then sent with `sendto()`. With `--use-shm`, the receiver builds each DIFI packet in a temporary buffer (header + copy of payload) because shm slots are not one contiguous packet.
+The first 32 bytes of each dequeued mbuf (the IQ chunk header) are overwritten with the DIFI data header; the IQ payload is not copied. The same buffer is then sent with `sendto()` / `sendmmsg()`.
